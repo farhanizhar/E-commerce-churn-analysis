@@ -1,0 +1,1728 @@
+---
+title: "E-Commerce Churn Analysis"
+author: "Farhanul Haque"
+date: "2026-06-25"
+output: html_document
+---
+
+# — Data Understanding
+
+# Step 1: Loading libraries.
+
+```{r libraries, message=FALSE, warning=FALSE}
+library(tidyverse)   # data manipulation + ggplot2
+library(lubridate)   # date handling
+library(skimr)       # quick data summary
+```
+
+# Step 2: Data Loading....
+
+```{r load-data, message=FALSE}
+# All files except geolocation( due to big data )
+customers  = read_csv("archive/olist_customers_dataset.csv")
+orders     = read_csv("archive/olist_orders_dataset.csv")
+items      = read_csv("archive/olist_order_items_dataset.csv")
+payments   = read_csv("archive/olist_order_payments_dataset.csv")
+reviews    = read_csv("archive/olist_order_reviews_dataset.csv")
+products   = read_csv("archive/olist_products_dataset.csv")
+sellers    = read_csv("archive/olist_sellers_dataset.csv")
+cat_names  = read_csv("archive/product_category_name_translation.csv")
+
+# Confirm: 
+cat("Customers: ", nrow(customers), "rows\n")
+cat("Orders:    ", nrow(orders),    "rows\n")
+cat("Items:     ", nrow(items),     "rows\n")
+cat("Payments:  ", nrow(payments),  "rows\n")
+cat("Reviews:   ", nrow(reviews),   "rows\n")
+cat("Products:  ", nrow(products),  "rows\n")
+cat("Sellers:   ", nrow(sellers),   "rows\n")
+```
+
+# Step 3: Understanding part
+
+# Customers Table
+```{r explore-customers}
+glimpse(customers)
+```
+
+# Orders Table
+```{r explore-orders}
+glimpse(orders)
+```
+
+# Order Items Table
+```{r explore-items}
+glimpse(items)
+```
+
+# Payments Table
+```{r explore-payments}
+glimpse(payments)
+```
+
+# Reviews Table
+```{r explore-reviews}
+glimpse(reviews)
+```
+
+# Products Table
+```{r explore-products}
+glimpse(products)
+```
+
+# Sellers Table
+```{r explore-sellers}
+glimpse(sellers)
+```
+
+# Step 4: Missing Values Check..
+
+```{r missing-values}
+# Har table mein missing values kitni hain
+missing_summary = function(df, name) {
+  df %>%
+    summarise(across(everything(), ~sum(is.na(.)))) %>%
+    pivot_longer(everything(),
+                 names_to  = "column",
+                 values_to = "missing_count") %>%
+    filter(missing_count > 0) %>%
+    mutate(table = name,
+           missing_pct = round(missing_count / nrow(df) * 100, 2))
+}
+
+# Checking for tables
+bind_rows(
+  missing_summary(customers, "customers"),
+  missing_summary(orders,    "orders"),
+  missing_summary(items,     "items"),
+  missing_summary(payments,  "payments"),
+  missing_summary(reviews,   "reviews"),
+  missing_summary(products,  "products"),
+  missing_summary(sellers,   "sellers")
+) %>%
+  arrange(table, desc(missing_count)) %>%
+  print(n = 50)
+```
+
+# Step 5: Time ranges of orders.
+
+```{r time-range}
+orders %>%
+  summarise(
+    earliest_order = min(order_purchase_timestamp, na.rm = TRUE),
+    latest_order   = max(order_purchase_timestamp, na.rm = TRUE),
+    total_days     = as.numeric(
+                       difftime(
+                         max(order_purchase_timestamp, na.rm = TRUE),
+                         min(order_purchase_timestamp, na.rm = TRUE),
+                         units = "days"
+                       )
+                     )
+  )
+```
+
+# Step 6: Order Status Distribution
+
+```{r order-status}
+orders %>%
+  count(order_status, sort = TRUE) %>%
+  mutate(percentage = round(n / sum(n) * 100, 2))
+```
+
+# Step 7: Verifying Table Relationships 
+
+```{r relationships}
+# Verify relationships between tables
+cat("Unique customer_ids in customers table:", 
+    n_distinct(customers$customer_id), "\n")
+
+cat("Unique customer_ids in orders table:   ", 
+    n_distinct(orders$customer_id), "\n")
+
+cat("\nUnique order_ids in orders table:     ", 
+    n_distinct(orders$order_id), "\n")
+
+cat("Unique order_ids in items table:      ", 
+    n_distinct(items$order_id), "\n")
+
+cat("Unique order_ids in payments table:   ", 
+    n_distinct(payments$order_id), "\n")
+
+cat("Unique order_ids in reviews table:    ", 
+    n_distinct(reviews$order_id), "\n")
+```
+
+# Phase 3 — Data Cleaning
+
+## Step 1: Keeping Only Delivered Orders
+
+```{r filter-delivered}
+# Only delivered orders — 96,478 orders
+orders_clean = orders %>%
+  filter(order_status == "delivered")
+
+cat("Orders after filtering:", nrow(orders_clean), "\n")
+```
+
+## Step 2: Translate Product Categories to English
+
+```{r translate-categories}
+products_clean = products %>%
+  left_join(cat_names, by = "product_category_name") %>%
+  mutate(category = coalesce(product_category_name_english,
+                             product_category_name))
+```
+
+## Step 3: Build Master Dataframe
+
+```{r master-dataframe}
+master = orders_clean %>%
+  # attach customer info
+  left_join(customers, by = "customer_id") %>%
+  # attach items (price, product)
+  left_join(items %>%
+              group_by(order_id) %>%
+              summarise(
+                order_value    = sum(price + freight_value),
+                total_items    = n()
+              ),
+            by = "order_id") %>%
+  # attach payment type
+  left_join(payments %>%
+              group_by(order_id) %>%
+              slice(1) %>%
+              select(order_id, payment_type),
+            by = "order_id") %>%
+  # attach review score
+  left_join(reviews %>%
+              group_by(order_id) %>%
+              slice(1) %>%
+              select(order_id, review_score),
+            by = "order_id") %>%
+  # keep only useful columns
+  select(
+    order_id,
+    customer_unique_id,
+    customer_state,
+    customer_city,
+    order_purchase_timestamp,
+    order_delivered_customer_date,
+    order_estimated_delivery_date,
+    order_value,
+    total_items,
+    payment_type,
+    review_score
+  )
+
+cat("Master dataframe rows:", nrow(master), "\n")
+cat("Master dataframe columns:", ncol(master), "\n")
+```
+
+## Step 4: Add Useful Columns
+
+```{r add-columns}
+master = master %>%
+  mutate(
+    # extract year and month for cohort analysis later
+    order_month = floor_date(order_purchase_timestamp, "month"),
+    order_year  = year(order_purchase_timestamp),
+
+    # delivery delay in days (negative = early delivery)
+    delivery_delay = as.numeric(
+      difftime(order_delivered_customer_date,
+               order_estimated_delivery_date,
+               units = "days")
+    ),
+
+    # was delivery late?
+    is_late = delivery_delay > 0
+  )
+```
+
+## Step 5: Final Check
+
+```{r final-check}
+cat("Total orders in master:", nrow(master), "\n")
+cat("Unique customers:      ", length(unique(master$customer_unique_id)), "\n")
+cat("Date range:            ",
+    format(min(master$order_purchase_timestamp)), "to",
+    format(max(master$order_purchase_timestamp)), "\n")
+
+# Missing values in master
+master %>%
+  summarise(across(everything(), ~sum(is.na(.)))) %>%
+  pivot_longer(everything(),
+               names_to  = "column",
+               values_to = "missing") %>%
+  filter(missing > 0)
+```
+
+# Phase 4 — Exploratory Data Analysis (EDA)
+
+## Plot 1: Orders Per Month
+
+```{r orders-per-month}
+master %>%
+  count(order_month) %>%
+  ggplot(aes(x = order_month, y = n)) +
+  geom_line(color = "#2196F3", linewidth = 1) +
+  geom_point(color = "#2196F3", size = 2) +
+  labs(
+    title    = "Orders Per Month (2016–2018)",
+    subtitle = "Overall business growth trend",
+    x        = "Month",
+    y        = "Number of Orders"
+  ) +
+  theme_minimal()
+```
+
+## Plot 2: Top 10 States by Orders
+
+```{r top-states}
+master %>%
+  count(customer_state, sort = TRUE) %>%
+  slice(1:10) %>%
+  ggplot(aes(x = reorder(customer_state, n), y = n)) +
+  geom_col(fill = "#4CAF50") +
+  coord_flip() +
+  labs(
+    title = "Top 10 States by Number of Orders",
+    x     = "State",
+    y     = "Orders"
+  ) +
+  theme_minimal()
+```
+
+## Plot 3: Order Value Distribution
+
+```{r order-value-dist}
+master %>%
+  filter(!is.na(order_value), order_value < 500) %>%
+  ggplot(aes(x = order_value)) +
+  geom_histogram(bins = 50, fill = "#9C27B0", color = "white") +
+  labs(
+    title    = "Order Value Distribution",
+    subtitle = "Orders above R$500 excluded for clarity",
+    x        = "Order Value (R$)",
+    y        = "Count"
+  ) +
+  theme_minimal()
+```
+
+## Plot 4: Payment Types
+
+```{r payment-types}
+master %>%
+  filter(!is.na(payment_type)) %>%
+  count(payment_type, sort = TRUE) %>%
+  mutate(pct = round(n / sum(n) * 100, 1)) %>%
+  ggplot(aes(x = reorder(payment_type, n), y = n)) +
+  geom_col(fill = "#FF9800") +
+  geom_text(aes(label = paste0(pct, "%")),
+            hjust = -0.1, size = 3.5) +
+  coord_flip() +
+  labs(
+    title = "Payment Type Distribution",
+    x     = "Payment Type",
+    y     = "Orders"
+  ) +
+  theme_minimal()
+```
+
+## Plot 5: Review Score Distribution
+
+```{r review-scores}
+master %>%
+  filter(!is.na(review_score)) %>%
+  count(review_score) %>%
+  mutate(pct = round(n / sum(n) * 100, 1)) %>%
+  ggplot(aes(x = factor(review_score), y = n,
+             fill = factor(review_score))) +
+  geom_col() +
+  geom_text(aes(label = paste0(pct, "%")),
+            vjust = -0.5, size = 3.5) +
+  scale_fill_manual(values = c(
+    "1" = "#F44336",
+    "2" = "#FF9800",
+    "3" = "#FFC107",
+    "4" = "#8BC34A",
+    "5" = "#4CAF50"
+  )) +
+  labs(
+    title = "Review Score Distribution",
+    x     = "Review Score",
+    y     = "Count"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+## Plot 6: Delivery Performance
+
+```{r delivery-performance}
+master %>%
+  filter(!is.na(is_late)) %>%
+  count(is_late) %>%
+  mutate(
+    label = ifelse(is_late, "Late", "On Time"),
+    pct   = round(n / sum(n) * 100, 1)
+  ) %>%
+  ggplot(aes(x = label, y = n, fill = label)) +
+  geom_col() +
+  geom_text(aes(label = paste0(pct, "%")),
+            vjust = -0.5, size = 4) +
+  scale_fill_manual(values = c(
+    "On Time" = "#4CAF50",
+    "Late"    = "#F44336"
+  )) +
+  labs(
+    title = "Delivery Performance",
+    x     = "",
+    y     = "Orders"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+## Key EDA Summary Stats
+
+```{r eda-summary}
+cat("Average order value:  R$", 
+    round(mean(master$order_value, na.rm = TRUE), 2), "\n")
+
+cat("Median order value:   R$", 
+    round(median(master$order_value, na.rm = TRUE), 2), "\n")
+
+cat("Average review score:", 
+    round(mean(master$review_score, na.rm = TRUE), 2), "\n")
+
+cat("Late deliveries:     ", 
+    round(mean(master$is_late, na.rm = TRUE) * 100, 1), "%\n")
+
+cat("Most used payment:   ", 
+    master %>% 
+      count(payment_type, sort = TRUE) %>% 
+      slice(1) %>% 
+      pull(payment_type), "\n")
+```
+# Phase 5 — Customer Analytics
+
+## Step 1: Repeat vs One-Time Buyers
+
+```{r repeat-vs-onetime}
+customer_orders = master %>%
+  group_by(customer_unique_id) %>%
+  summarise(
+    total_orders    = n(),
+    total_spent     = sum(order_value, na.rm = TRUE),
+    avg_order_value = mean(order_value, na.rm = TRUE),
+    first_order     = min(order_purchase_timestamp),
+    last_order      = max(order_purchase_timestamp),
+    avg_review      = mean(review_score, na.rm = TRUE)
+  ) %>%
+  mutate(
+    customer_type = ifelse(total_orders == 1, 
+                           "One-Time", 
+                           "Repeat")
+  )
+
+# Summary
+customer_orders %>%
+  count(customer_type) %>%
+  mutate(percentage = round(n / sum(n) * 100, 2))
+```
+
+## Step 2: Visualize One-Time vs Repeat
+
+```{r plot-customer-type}
+customer_orders %>%
+  count(customer_type) %>%
+  mutate(pct = round(n / sum(n) * 100, 1)) %>%
+  ggplot(aes(x = customer_type, y = n, fill = customer_type)) +
+  geom_col(width = 0.5) +
+  geom_text(aes(label = paste0(pct, "%\n(", n, ")")),
+            vjust = -0.3, size = 4) +
+  scale_fill_manual(values = c(
+    "One-Time" = "#F44336",
+    "Repeat"   = "#4CAF50"
+  )) +
+  labs(
+    title    = "One-Time vs Repeat Customers",
+    subtitle = "How many customers came back?",
+    x        = "",
+    y        = "Number of Customers"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+## Step 3: Purchase Frequency Distribution
+
+```{r purchase-frequency}
+customer_orders %>%
+  filter(total_orders <= 10) %>%
+  count(total_orders) %>%
+  mutate(pct = round(n / sum(n) * 100, 1)) %>%
+  ggplot(aes(x = factor(total_orders), y = n)) +
+  geom_col(fill = "#2196F3") +
+  geom_text(aes(label = paste0(pct, "%")),
+            vjust = -0.5, size = 3.5) +
+  labs(
+    title    = "Purchase Frequency Distribution",
+    subtitle = "How many orders did each customer place?",
+    x        = "Number of Orders",
+    y        = "Number of Customers"
+  ) +
+  theme_minimal()
+```
+
+## Step 4: Time Between First and Second Order
+
+```{r time-to-second-order}
+# Only repeat customers
+time_to_second = master %>%
+  group_by(customer_unique_id) %>%
+  arrange(order_purchase_timestamp) %>%
+  mutate(order_rank = row_number()) %>%
+  filter(order_rank <= 2) %>%
+  summarise(
+    days_to_second = as.numeric(
+      difftime(
+        max(order_purchase_timestamp),
+        min(order_purchase_timestamp),
+        units = "days"
+      )
+    ),
+    .groups = "drop"
+  ) %>%
+  filter(days_to_second > 0)  # only repeat customers
+
+cat("Avg days to second order:", 
+    round(mean(time_to_second$days_to_second), 1), "\n")
+cat("Median days to second order:", 
+    round(median(time_to_second$days_to_second), 1), "\n")
+
+# Plot
+time_to_second %>%
+  filter(days_to_second <= 365) %>%
+  ggplot(aes(x = days_to_second)) +
+  geom_histogram(bins = 30, fill = "#9C27B0", color = "white") +
+  geom_vline(xintercept = median(time_to_second$days_to_second),
+             color = "red", linetype = "dashed", linewidth = 1) +
+  annotate("text",
+           x    = median(time_to_second$days_to_second) + 15,
+           y    = Inf,
+           label = paste0("Median: ",
+                          round(median(time_to_second$days_to_second)),
+                          " days"),
+           vjust = 2, hjust = 0, color = "red") +
+  labs(
+    title    = "Days Between First and Second Order",
+    subtitle = "Among repeat customers only",
+    x        = "Days",
+    y        = "Count"
+  ) +
+  theme_minimal()
+```
+
+## Step 5: Revenue by Customer Type
+
+```{r revenue-by-type}
+customer_orders %>%
+  group_by(customer_type) %>%
+  summarise(
+    customers       = n(),
+    total_revenue   = round(sum(total_spent, na.rm = TRUE), 0),
+    avg_spent       = round(mean(total_spent, na.rm = TRUE), 2),
+    .groups = "drop"
+  ) %>%
+  mutate(revenue_pct = round(total_revenue / sum(total_revenue) * 100, 1))
+```
+
+## Step 6: Customer Analytics Summary
+
+```{r customer-summary}
+cat("Total unique customers:     ", nrow(customer_orders), "\n")
+cat("One-time buyers:            ", 
+    sum(customer_orders$customer_type == "One-Time"), "\n")
+cat("Repeat buyers:              ", 
+    sum(customer_orders$customer_type == "Repeat"), "\n")
+cat("Repeat rate:                ", 
+    round(mean(customer_orders$customer_type == "Repeat") * 100, 2), 
+    "%\n")
+cat("Max orders by one customer: ", 
+    max(customer_orders$total_orders), "\n")
+cat("Avg spend - One-Time:    R$",
+    round(mean(customer_orders$total_spent[
+      customer_orders$customer_type == "One-Time"], 
+      na.rm = TRUE), 2), "\n")
+cat("Avg spend - Repeat:      R$",
+    round(mean(customer_orders$total_spent[
+      customer_orders$customer_type == "Repeat"], 
+      na.rm = TRUE), 2), "\n")
+```
+# Phase 6 — Churn Analysis
+
+## Step 1: Define Churn Label
+
+```{r define-churn}
+# Reference date = last date in dataset
+reference_date = max(master$order_purchase_timestamp, 
+                      na.rm = TRUE)
+
+cat("Reference date:", format(reference_date), "\n")
+
+# Label each customer as churned or retained
+churn_data = customer_orders %>%
+  mutate(
+    days_since_last_order = as.numeric(
+      difftime(reference_date, last_order, units = "days")
+    ),
+    churned = ifelse(days_since_last_order > 180, 1, 0),
+    churn_label = ifelse(churned == 1, "Churned", "Retained")
+  )
+
+# Overall churn rate
+churn_data %>%
+  count(churn_label) %>%
+  mutate(percentage = round(n / sum(n) * 100, 2))
+```
+
+## Step 2: Visualize Churn Rate
+
+```{r plot-churn-rate}
+churn_data %>%
+  count(churn_label) %>%
+  mutate(pct = round(n / sum(n) * 100, 1)) %>%
+  ggplot(aes(x = churn_label, y = n, fill = churn_label)) +
+  geom_col(width = 0.5) +
+  geom_text(aes(label = paste0(pct, "%\n(", n, ")")),
+            vjust = -0.3, size = 4) +
+  scale_fill_manual(values = c(
+    "Churned"  = "#F44336",
+    "Retained" = "#4CAF50"
+  )) +
+  labs(
+    title    = "Customer Churn Rate",
+    subtitle = "Churned = no order in 180 days",
+    x        = "",
+    y        = "Number of Customers"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+## Step 3: Churn vs Review Score
+
+```{r churn-vs-review}
+# Join churn data with master for review scores
+churn_review = master %>%
+  group_by(customer_unique_id) %>%
+  summarise(
+    avg_review = mean(review_score, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  left_join(churn_data %>% 
+              select(customer_unique_id, churn_label),
+            by = "customer_unique_id") %>%
+  filter(!is.na(avg_review), !is.na(churn_label))
+
+# Average review score by churn status
+churn_review %>%
+  group_by(churn_label) %>%
+  summarise(
+    avg_review_score = round(mean(avg_review), 2),
+    customers        = n(),
+    .groups = "drop"
+  )
+```
+
+```{r plot-churn-review}
+churn_review %>%
+  ggplot(aes(x = factor(round(avg_review)), 
+             fill = churn_label)) +
+  geom_bar(position = "fill") +
+  scale_y_continuous(labels = scales::percent) +
+  scale_fill_manual(values = c(
+    "Churned"  = "#F44336",
+    "Retained" = "#4CAF50"
+  )) +
+  labs(
+    title    = "Churn Rate by Review Score",
+    subtitle = "Do unhappy customers churn more?",
+    x        = "Review Score",
+    y        = "Proportion",
+    fill     = ""
+  ) +
+  theme_minimal()
+```
+
+## Step 4: Churn vs Delivery Delay
+
+```{r churn-vs-delivery}
+churn_delivery = master %>%
+  group_by(customer_unique_id) %>%
+  summarise(
+    avg_delay = mean(delivery_delay, na.rm = TRUE),
+    was_late  = any(is_late, na.rm = TRUE),
+    .groups   = "drop"
+  ) %>%
+  left_join(churn_data %>%
+              select(customer_unique_id, churn_label),
+            by = "customer_unique_id") %>%
+  filter(!is.na(churn_label))
+
+# Late delivery churn rate vs on-time
+churn_delivery %>%
+  filter(!is.na(was_late)) %>%
+  group_by(was_late, churn_label) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(was_late) %>%
+  mutate(
+    pct        = round(n / sum(n) * 100, 2),
+    late_label = ifelse(was_late, "Late Delivery", "On Time")
+  )
+```
+
+```{r plot-churn-delivery}
+churn_delivery %>%
+  filter(!is.na(was_late)) %>%
+  mutate(late_label = ifelse(was_late, 
+                             "Late Delivery", 
+                             "On Time")) %>%
+  ggplot(aes(x = late_label, fill = churn_label)) +
+  geom_bar(position = "fill") +
+  scale_y_continuous(labels = scales::percent) +
+  scale_fill_manual(values = c(
+    "Churned"  = "#F44336",
+    "Retained" = "#4CAF50"
+  )) +
+  labs(
+    title    = "Churn Rate: Late vs On-Time Delivery",
+    subtitle = "Does late delivery increase churn?",
+    x        = "",
+    y        = "Proportion",
+    fill     = ""
+  ) +
+  theme_minimal()
+```
+
+## Step 5: Churn vs Order Value
+
+```{r churn-vs-ordervalue}
+churn_data %>%
+  filter(!is.na(avg_order_value)) %>%
+  mutate(
+    value_segment = case_when(
+      avg_order_value < 50   ~ "Low (<R$50)",
+      avg_order_value < 150  ~ "Medium (R$50-150)",
+      avg_order_value < 300  ~ "High (R$150-300)",
+      TRUE                   ~ "Premium (>R$300)"
+    ),
+    value_segment = factor(value_segment, levels = c(
+      "Low (<R$50)", "Medium (R$50-150)",
+      "High (R$150-300)", "Premium (>R$300)"
+    ))
+  ) %>%
+  group_by(value_segment, churn_label) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(value_segment) %>%
+  mutate(pct = round(n / sum(n) * 100, 1)) %>%
+  ggplot(aes(x = value_segment, y = pct, 
+             fill = churn_label)) +
+  geom_col() +
+  geom_text(aes(label = paste0(pct, "%")),
+            position = position_stack(vjust = 0.5),
+            size = 3.5, color = "white") +
+  scale_fill_manual(values = c(
+    "Churned"  = "#F44336",
+    "Retained" = "#4CAF50"
+  )) +
+  labs(
+    title = "Churn Rate by Order Value Segment",
+    x     = "Order Value Segment",
+    y     = "Percentage",
+    fill  = ""
+  ) +
+  theme_minimal()
+```
+
+## Step 6: Churn Summary
+
+```{r churn-summary}
+total     = nrow(churn_data)
+churned   = sum(churn_data$churned == 1)
+retained  = sum(churn_data$churned == 0)
+
+cat("Total customers:    ", total, "\n")
+cat("Churned:            ", churned,
+    "(", round(churned/total*100, 1), "%)\n")
+cat("Retained:           ", retained,
+    "(", round(retained/total*100, 1), "%)\n")
+
+cat("\nAvg review - Churned:  ",
+    round(mean(churn_review$avg_review[
+      churn_review$churn_label == "Churned"], 
+      na.rm = TRUE), 2), "\n")
+
+cat("Avg review - Retained: ",
+    round(mean(churn_review$avg_review[
+      churn_review$churn_label == "Retained"], 
+      na.rm = TRUE), 2), "\n")
+```
+# Phase 7 — Cohort Analysis
+
+## Step 1: Build Cohort Table
+
+```{r cohort-setup}
+# Step 1: Assign cohort month to each customer
+# Cohort = month of first ever purchase
+cohort_data <- master %>%
+  group_by(customer_unique_id) %>%
+  mutate(
+    cohort_month = floor_date(
+      min(order_purchase_timestamp), "month"
+    )
+  ) %>%
+  ungroup()
+
+# Step 2: Calculate order month number
+# (how many months after first purchase)
+cohort_data <- cohort_data %>%
+  mutate(
+    order_month_date = floor_date(
+      order_purchase_timestamp, "month"
+    ),
+    month_number = as.integer(
+      interval(cohort_month, order_month_date) %/% months(1)
+    )
+  )
+
+# Step 3: Count unique customers per cohort per month
+cohort_table <- cohort_data %>%
+  group_by(cohort_month, month_number) %>%
+  summarise(
+    customers = n_distinct(customer_unique_id),
+    .groups   = "drop"
+  )
+
+# Step 4: Get cohort sizes (month 0 = starting size)
+cohort_size <- cohort_table %>%
+  filter(month_number == 0) %>%
+  select(cohort_month, cohort_size = customers)
+
+# Step 5: Calculate retention percentage
+cohort_pct <- cohort_table %>%
+  left_join(cohort_size, by = "cohort_month") %>%
+  mutate(
+    retention_pct = round(customers / cohort_size * 100, 1)
+  ) %>%
+  filter(
+    cohort_month >= as.Date("2017-01-01"),
+    cohort_month <= as.Date("2018-04-01"),
+    month_number  <= 12
+  )
+
+cat("Cohort table built successfully\n")
+cat("Cohorts:", n_distinct(cohort_pct$cohort_month), "\n")
+```
+
+## Step 2: Retention Heatmap
+
+```{r cohort-heatmap, fig.width=12, fig.height=8}
+cohort_pct %>%
+  mutate(
+    cohort_label = format(cohort_month, "%b %Y")
+  ) %>%
+  ggplot(aes(
+    x    = factor(month_number),
+    y    = reorder(cohort_label, desc(cohort_month)),
+    fill = retention_pct
+  )) +
+  geom_tile(color = "white", linewidth = 0.5) +
+  geom_text(
+    aes(label = paste0(retention_pct, "%")),
+    size  = 3,
+    color = ifelse(cohort_pct$retention_pct > 20, 
+                   "white", "black")
+  ) +
+  scale_fill_gradient2(
+    low      = "#FFEBEE",
+    mid      = "#EF9A9A",
+    high     = "#B71C1C",
+    midpoint = 10,
+    name     = "Retention %"
+  ) +
+  labs(
+    title    = "Customer Retention Cohort Analysis",
+    subtitle = "% of customers returning each month after first purchase",
+    x        = "Months After First Purchase",
+    y        = "Cohort (First Purchase Month)"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text  = element_text(size = 9),
+    plot.title = element_text(size = 14, face = "bold")
+  )
+```
+
+## Step 3: Month 1 Retention by Cohort
+
+```{r month1-retention}
+# How many came back in month 1?
+month1 = cohort_pct %>%
+  filter(month_number == 1) %>%
+  arrange(desc(retention_pct)) %>%
+  mutate(cohort_label = format(cohort_month, "%b %Y"))
+
+cat("Average Month 1 retention:", 
+    round(mean(month1$retention_pct), 2), "%\n")
+cat("Best cohort: ", 
+    month1$cohort_label[1], "→",
+    month1$retention_pct[1], "%\n")
+cat("Worst cohort:", 
+    month1$cohort_label[nrow(month1)], "→",
+    month1$retention_pct[nrow(month1)], "%\n")
+```
+
+```{r plot-month1}
+month1 %>%
+  ggplot(aes(
+    x    = reorder(cohort_label, retention_pct),
+    y    = retention_pct,
+    fill = retention_pct
+  )) +
+  geom_col() +
+  geom_text(aes(label = paste0(retention_pct, "%")),
+            hjust = -0.1, size = 3.5) +
+  coord_flip() +
+  scale_fill_gradient(
+    low  = "#FFCDD2",
+    high = "#C62828"
+  ) +
+  labs(
+    title    = "Month 1 Retention Rate by Cohort",
+    subtitle = "What % came back the very next month?",
+    x        = "Cohort",
+    y        = "Retention %"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+## Step 4: Overall Retention Curve
+
+```{r retention-curve}
+retention_curve <- cohort_pct %>%
+  group_by(month_number) %>%
+  summarise(
+    avg_retention = round(mean(retention_pct), 2),
+    .groups = "drop"
+  )
+
+retention_curve %>%
+  ggplot(aes(x = month_number, y = avg_retention)) +
+  geom_line(color = "#C62828", linewidth = 1.2) +
+  geom_point(color = "#C62828", size = 3) +
+  geom_text(aes(label = paste0(avg_retention, "%")),
+            vjust = -0.8, size = 3.5) +
+  scale_x_continuous(breaks = 0:12) +
+  labs(
+    title    = "Average Retention Curve",
+    subtitle = "How quickly do customers drop off?",
+    x        = "Months After First Purchase",
+    y        = "Avg Retention %"
+  ) +
+  theme_minimal()
+```
+
+## Step 5: Cohort Summary
+
+```{r cohort-summary}
+cat("=== Cohort Analysis Summary ===\n\n")
+
+cat("Month 0 retention:  100% (baseline)\n")
+
+cat("Month 1 avg retention:", 
+    retention_curve$avg_retention[
+      retention_curve$month_number == 1], "%\n")
+
+cat("Month 3 avg retention:", 
+    retention_curve$avg_retention[
+      retention_curve$month_number == 3], "%\n")
+
+cat("Month 6 avg retention:", 
+    retention_curve$avg_retention[
+      retention_curve$month_number == 6], "%\n")
+
+cat("Month 12 avg retention:", 
+    retention_curve$avg_retention[
+      retention_curve$month_number == 12], "%\n")
+```
+# Phase 8 — RFM Segmentation
+
+## Step 1: Calculate RFM Scores
+
+```{r rfm-calculate}
+reference_date = max(master$order_purchase_timestamp, 
+                      na.rm = TRUE)
+
+rfm_data = master %>%
+  group_by(customer_unique_id) %>%
+  summarise(
+    recency   = as.numeric(difftime(
+                  reference_date,
+                  max(order_purchase_timestamp),
+                  units = "days")),
+    frequency = n(),
+    monetary  = sum(order_value, na.rm = TRUE),
+    .groups   = "drop"
+  )
+
+cat("RFM base table built\n")
+cat("Total customers:", nrow(rfm_data), "\n")
+glimpse(rfm_data)
+```
+
+## Step 2: Score Each Customer 1–5
+
+```{r rfm-scoring}
+rfm_scored = rfm_data %>%
+  mutate(
+    # Recency: lower days = better = higher score
+    r_score = ntile(desc(recency),  5),
+    # Frequency: higher = better = higher score
+    f_score = ntile(frequency, 5),
+    # Monetary: higher = better = higher score
+    m_score = ntile(monetary,  5),
+    # Combined RFM score
+    rfm_score = r_score + f_score + m_score
+  )
+
+cat("Score distribution:\n")
+summary(rfm_scored$rfm_score)
+```
+
+## Step 3: Assign Segments
+
+```{r rfm-segments}
+rfm_scored = rfm_scored %>%
+  mutate(
+    segment = case_when(
+      r_score >= 4 & f_score >= 4 & m_score >= 4 ~ "Champions",
+      r_score >= 3 & f_score >= 3                ~ "Loyal Customers",
+      r_score >= 4 & f_score <= 2                ~ "Potential Loyalists",
+      r_score >= 3 & f_score <= 2 & m_score >= 3 ~ "Promising",
+      r_score <= 2 & f_score >= 3                ~ "At Risk",
+      r_score <= 2 & f_score <= 2 & m_score >= 3 ~ "Cant Lose Them",
+      r_score == 1 & f_score == 1                ~ "Lost",
+      TRUE                                        ~ "Need Attention"
+    )
+  )
+
+# Segment distribution
+rfm_scored %>%
+  count(segment, sort = TRUE) %>%
+  mutate(percentage = round(n / sum(n) * 100, 1))
+```
+
+## Step 4: Visualize Segments
+
+```{r plot-rfm-segments}
+rfm_scored %>%
+  count(segment) %>%
+  mutate(pct = round(n / sum(n) * 100, 1)) %>%
+  ggplot(aes(
+    x    = reorder(segment, n),
+    y    = n,
+    fill = segment
+  )) +
+  geom_col() +
+  geom_text(aes(label = paste0(pct, "%\n(", n, ")")),
+            hjust = -0.05, size = 3.5) +
+  coord_flip() +
+  scale_fill_manual(values = c(
+    "Champions"          = "#1B5E20",
+    "Loyal Customers"    = "#388E3C",
+    "Potential Loyalists"= "#81C784",
+    "Promising"          = "#FFF176",
+    "Need Attention"     = "#FFB74D",
+    "At Risk"            = "#EF6C00",
+    "Cant Lose Them"     = "#F44336",
+    "Lost"               = "#B71C1C"
+  )) +
+  labs(
+    title    = "RFM Customer Segments",
+    subtitle = "Customer distribution across segments",
+    x        = "",
+    y        = "Number of Customers"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+## Step 5: Segment Revenue Analysis
+
+```{r rfm-revenue}
+segment_revenue = rfm_scored %>%
+  group_by(segment) %>%
+  summarise(
+    customers     = n(),
+    total_revenue = round(sum(monetary), 0),
+    avg_revenue   = round(mean(monetary), 2),
+    avg_recency   = round(mean(recency), 0),
+    avg_frequency = round(mean(frequency), 2),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    revenue_pct = round(total_revenue / 
+                        sum(total_revenue) * 100, 1)
+  ) %>%
+  arrange(desc(total_revenue))
+
+print(segment_revenue)
+```
+
+## Step 6: RFM Score Heatmap
+
+```{r rfm-heatmap, fig.width=8, fig.height=6}
+rfm_scored %>%
+  group_by(r_score, f_score) %>%
+  summarise(
+    avg_monetary = mean(monetary),
+    customers    = n(),
+    .groups      = "drop"
+  ) %>%
+  ggplot(aes(
+    x    = factor(f_score),
+    y    = factor(r_score),
+    fill = avg_monetary
+  )) +
+  geom_tile(color = "white", linewidth = 0.5) +
+  geom_text(aes(label = round(avg_monetary, 0)),
+            size = 3.5) +
+  scale_fill_gradient(
+    low  = "#E3F2FD",
+    high = "#1565C0",
+    name = "Avg Revenue (R$)"
+  ) +
+  labs(
+    title    = "RFM Score Heatmap",
+    subtitle = "Average revenue by Recency vs Frequency score",
+    x        = "Frequency Score (1=Low, 5=High)",
+    y        = "Recency Score (1=Old, 5=Recent)"
+  ) +
+  theme_minimal()
+```
+
+## Step 7: Champions vs Lost — Deep Comparison
+
+```{r champions-vs-lost}
+rfm_scored %>%
+  filter(segment %in% c("Champions", "Lost")) %>%
+  group_by(segment) %>%
+  summarise(
+    customers     = n(),
+    avg_recency   = round(mean(recency), 1),
+    avg_frequency = round(mean(frequency), 2),
+    avg_monetary  = round(mean(monetary), 2),
+    total_revenue = round(sum(monetary), 0),
+    .groups       = "drop"
+  )
+```
+
+## Step 8: RFM Summary
+
+```{r rfm-summary}
+cat("=== RFM Segmentation Summary ===\n\n")
+
+cat("Total customers segmented:", nrow(rfm_scored), "\n\n")
+
+top_segment <- rfm_scored %>%
+  count(segment, sort = TRUE) %>%
+  slice(1)
+
+cat("Largest segment:", top_segment$segment,
+    "(", top_segment$n, "customers )\n")
+
+champions <- rfm_scored %>% 
+  filter(segment == "Champions")
+cat("\nChampions count:", nrow(champions), "\n")
+cat("Champions avg spend: R$",
+    round(mean(champions$monetary), 2), "\n")
+cat("Champions avg orders:",
+    round(mean(champions$frequency), 2), "\n")
+
+lost <- rfm_scored %>% 
+  filter(segment == "Lost")
+cat("\nLost customers:", nrow(lost), "\n")
+cat("Lost avg spend: R$",
+    round(mean(lost$monetary), 2), "\n")
+```
+# Phase 9 — Customer Lifetime Value (CLV)
+
+## Step 1: Calculate CLV Per Customer
+
+```{r clv-calculate}
+# Dataset span in years
+dataset_days  = as.numeric(difftime(
+  max(master$order_purchase_timestamp, na.rm = TRUE),
+  min(master$order_purchase_timestamp, na.rm = TRUE),
+  units = "days"
+))
+dataset_years = dataset_days / 365
+
+cat("Dataset spans:", round(dataset_years, 2), "years\n\n")
+
+# CLV per customer
+clv_data = rfm_scored %>%
+  mutate(
+    # Average order value
+    avg_order_value = monetary / frequency,
+    
+    # Purchase frequency per year
+    frequency_per_year = frequency / dataset_years,
+    
+    # Customer lifespan in years
+    # (days between first and last order / 365)
+    lifespan_years = case_when(
+      frequency == 1 ~ 0.5,  # one-time = assume 6 months
+      TRUE ~ as.numeric(difftime(
+        max(master$order_purchase_timestamp, na.rm = TRUE),
+        min(master$order_purchase_timestamp, na.rm = TRUE),
+        units = "days"
+      )) / 365
+    ),
+    
+    # CLV = AOV × Frequency/year × Lifespan
+    clv = avg_order_value * frequency_per_year * lifespan_years
+  )
+
+cat("CLV calculated for", nrow(clv_data), "customers\n")
+summary(clv_data$clv)
+```
+
+## Step 2: CLV by Segment
+
+```{r clv-by-segment}
+clv_segment = clv_data %>%
+  group_by(segment) %>%
+  summarise(
+    customers    = n(),
+    avg_clv      = round(mean(clv, na.rm = TRUE), 2),
+    median_clv   = round(median(clv, na.rm = TRUE), 2),
+    total_clv    = round(sum(clv, na.rm = TRUE), 0),
+    avg_monetary = round(mean(monetary, na.rm = TRUE), 2),
+    .groups      = "drop"
+  ) %>%
+  arrange(desc(avg_clv))
+
+print(clv_segment)
+```
+
+## Step 3: Visualize CLV by Segment
+
+```{r plot-clv-segment, fig.width=10, fig.height=6}
+clv_segment %>%
+  ggplot(aes(
+    x    = reorder(segment, avg_clv),
+    y    = avg_clv,
+    fill = segment
+  )) +
+  geom_col() +
+  geom_text(aes(label = paste0("R$", avg_clv)),
+            hjust = -0.1, size = 3.5) +
+  coord_flip() +
+  scale_fill_manual(values = c(
+    "Champions"           = "#1B5E20",
+    "Loyal Customers"     = "#388E3C",
+    "Potential Loyalists" = "#81C784",
+    "Promising"           = "#FFF176",
+    "Need Attention"      = "#FFB74D",
+    "At Risk"             = "#EF6C00",
+    "Cant Lose Them"      = "#F44336",
+    "Lost"                = "#B71C1C"
+  )) +
+  labs(
+    title    = "Average Customer Lifetime Value by Segment",
+    subtitle = "Which segments are most valuable?",
+    x        = "",
+    y        = "Average CLV (R$)"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+## Step 4: Revenue at Risk Calculation
+
+```{r revenue-at-risk}
+# At Risk + Cant Lose Them = immediate danger
+at_risk_clv = clv_data %>%
+  filter(segment %in% c("At Risk", "Cant Lose Them")) %>%
+  summarise(
+    customers       = n(),
+    total_clv       = round(sum(clv), 0),
+    avg_clv         = round(mean(clv), 2),
+    total_revenue   = round(sum(monetary), 0),
+    .groups         = "drop"
+  )
+
+cat("=== Revenue At Risk ===\n")
+cat("At Risk + Cant Lose Them customers:",
+    at_risk_clv$customers, "\n")
+cat("Their historical revenue:    R$",
+    at_risk_clv$total_revenue, "\n")
+cat("Their projected CLV:         R$",
+    at_risk_clv$total_clv, "\n")
+```
+
+## Step 5: CLV Uplift If At Risk Recovered
+
+```{r clv-uplift}
+# What if we convert At Risk to Champions?
+champions_avg_clv = clv_segment %>%
+  filter(segment == "Champions") %>%
+  pull(avg_clv)
+
+at_risk_count = clv_data %>%
+  filter(segment == "At Risk") %>%
+  nrow()
+
+cant_lose_count = clv_data %>%
+  filter(segment == "Cant Lose Them") %>%
+  nrow()
+
+at_risk_avg_clv = clv_segment %>%
+  filter(segment == "At Risk") %>%
+  pull(avg_clv)
+
+cant_lose_avg_clv = clv_segment %>%
+  filter(segment == "Cant Lose Them") %>%
+  pull(avg_clv)
+
+# Uplift calculation
+uplift_at_risk = at_risk_count * 
+                  (champions_avg_clv - at_risk_avg_clv)
+
+uplift_cant_lose = cant_lose_count * 
+                    (champions_avg_clv - cant_lose_avg_clv)
+
+cat("=== CLV Uplift Potential ===\n\n")
+cat("If At Risk → Champions:\n")
+cat("  Customers:", at_risk_count, "\n")
+cat("  CLV uplift: R$", round(uplift_at_risk, 0), "\n\n")
+
+cat("If Cant Lose Them → Champions:\n")
+cat("  Customers:", cant_lose_count, "\n")
+cat("  CLV uplift: R$", round(uplift_cant_lose, 0), "\n\n")
+
+cat("Total potential CLV uplift: R$",
+    round(uplift_at_risk + uplift_cant_lose, 0), "\n")
+```
+
+## Step 6: CLV Distribution Plot
+
+```{r plot-clv-distribution}
+clv_data %>%
+  filter(clv < quantile(clv, 0.95)) %>%
+  ggplot(aes(x = clv, fill = segment)) +
+  geom_histogram(bins = 40, color = "white") +
+  scale_fill_manual(values = c(
+    "Champions"           = "#1B5E20",
+    "Loyal Customers"     = "#388E3C",
+    "Potential Loyalists" = "#81C784",
+    "Promising"           = "#FFF176",
+    "Need Attention"      = "#FFB74D",
+    "At Risk"             = "#EF6C00",
+    "Cant Lose Them"      = "#F44336",
+    "Lost"                = "#B71C1C"
+  )) +
+  labs(
+    title    = "CLV Distribution by Segment",
+    subtitle = "Top 5% excluded for clarity",
+    x        = "Customer Lifetime Value (R$)",
+    y        = "Count",
+    fill     = "Segment"
+  ) +
+  theme_minimal()
+```
+
+## Step 7: CLV Summary
+
+```{r clv-summary}
+cat("=== CLV Summary ===\n\n")
+
+cat("Overall avg CLV:     R$",
+    round(mean(clv_data$clv, na.rm = TRUE), 2), "\n")
+
+cat("Overall median CLV:  R$",
+    round(median(clv_data$clv, na.rm = TRUE), 2), "\n")
+
+champions_clv <- clv_segment %>%
+  filter(segment == "Champions") %>%
+  pull(avg_clv)
+
+lost_clv <- clv_segment %>%
+  filter(segment == "Lost") %>%
+  pull(avg_clv)
+
+cat("\nChampions avg CLV:   R$", champions_clv, "\n")
+cat("Lost avg CLV:        R$", lost_clv, "\n")
+cat("Champions vs Lost:   ",
+    round(champions_clv / lost_clv, 1),
+    "x more valuable\n")
+
+cat("\nTotal platform CLV:  R$",
+    round(sum(clv_data$clv, na.rm = TRUE), 0), "\n")
+```
+# Phase 11 — Business Recommendations
+
+## Overview
+
+This analysis of 93,358 customers and 96,478 
+delivered orders (Sept 2016 – Oct 2018) reveals 
+that Olist faces a fundamental customer retention 
+challenge. The following recommendations are 
+derived directly from the data findings across 
+all analytical phases.
+
+---
+
+## Key Findings Summary
+
+```{r findings-summary}
+findings <- data.frame(
+  Finding = c(
+    "One-Time Buyer Rate",
+    "Overall Churn Rate (180 days)",
+    "Month 1 Cohort Retention",
+    "Repeat Customer Avg Spend vs One-Time",
+    "Champions vs Lost CLV Gap",
+    "Revenue at Risk (At Risk + Cant Lose Them)",
+    "CLV Uplift Potential"
+  ),
+  Value = c(
+    "97%",
+    "59.2%",
+    "0.47%",
+    "R$308 vs R$160 (92% more)",
+    "8.6x",
+    "R$ 5,821,138",
+    "R$ 2,077,785"
+  ),
+  Implication = c(
+    "Platform loyalty nearly non-existent",
+    "Majority of customers do not return",
+    "Almost no customer returns next month",
+    "Repeat buyers are significantly more valuable",
+    "Retaining top customers is critical",
+    "High-value customers are disengaging",
+    "Recoverable if action taken now"
+  )
+)
+
+knitr::kable(findings, 
+             caption = "Key Findings at a Glance")
+```
+
+---
+
+## Recommendation 1 — Launch a Loyalty Program
+
+**Priority: HIGH**
+
+**Based on:** 97% one-time buyer rate, 
+repeat customers spend 92% more
+
+**The Problem:**
+
+Customers have no incentive to return to 
+Olist specifically. They are satisfied with 
+their purchase but feel no platform attachment. 
+Review scores average 4.16/5 — the experience 
+is good, but nothing pulls them back.
+
+**The Recommendation:**
+
+Introduce an "Olist Points" loyalty program 
+where customers earn points on every purchase 
+redeemable for discounts on future orders.
+
+```{r loyalty-impact}
+# Estimated impact if repeat rate improves
+current_repeat    = 0.03
+target_repeat     = 0.08   # conservative 8% target
+total_customers   = 93358
+avg_repeat_spend  = 308.53
+avg_onetime_spend = 160.73
+
+additional_repeats = total_customers * 
+                      (target_repeat - current_repeat)
+
+revenue_uplift = additional_repeats * 
+                  (avg_repeat_spend - avg_onetime_spend)
+
+cat("Current repeat rate:       ", 
+    current_repeat * 100, "%\n")
+cat("Target repeat rate:        ", 
+    target_repeat * 100, "%\n")
+cat("Additional repeat customers:", 
+    round(additional_repeats), "\n")
+cat("Estimated revenue uplift:  R$", 
+    round(revenue_uplift, 0), "\n")
+```
+
+---
+
+## Recommendation 2 — Target At Risk Segment Immediately
+
+**Priority: HIGH**
+
+**Based on:** At Risk = 22,311 customers, 
+R$3.7M historical revenue, 394 days inactive
+
+**The Problem:**
+
+The At Risk segment is the single largest 
+revenue-generating group — yet they have not 
+purchased in over 13 months on average. 
+Every day without action increases permanent 
+churn probability.
+
+**The Recommendation:**
+
+Launch a targeted win-back campaign 
+specifically for At Risk customers:
+
+```{r atrisk-breakdown}
+at_risk_stats = churn_data %>%
+  left_join(
+    rfm_scored %>% select(customer_unique_id, segment),
+    by = "customer_unique_id"
+  ) %>%
+  filter(segment == "At Risk") %>%
+  summarise(
+    customers         = n(),
+    avg_days_inactive = round(mean(days_since_last_order, na.rm = TRUE), 0),
+    avg_spent         = round(mean(total_spent, na.rm = TRUE), 2),
+    total_revenue     = round(sum(total_spent,  na.rm = TRUE), 0)
+  )
+
+knitr::kable(at_risk_stats,
+             caption = "At Risk Segment Profile",
+             col.names = c("Customers",
+                           "Avg Days Inactive",
+                           "Avg Spent (R$)",
+                           "Total Revenue (R$)"))
+```
+
+**Win-back campaign structure:**
+
+- Day 1: Personalized email — "We miss you" 
+  with 10% discount code
+- Day 15: Follow-up email with 
+  "Top picks based on your last order"
+- Day 30: Final offer — 
+  15% discount with urgency message
+- Day 45: Move to "Lost" if no response
+
+---
+
+## Recommendation 3 — Protect Champions Segment
+
+**Priority: HIGH**
+
+**Based on:** Champions = 6,473 customers, 
+avg CLV R$122 — 8.6x more valuable than Lost
+
+**The Problem:**
+
+Champions are the most valuable customers 
+but receive no special treatment currently. 
+Without recognition, even Champions can 
+become At Risk over time.
+
+**The Recommendation:**
+
+Create a VIP program exclusively for Champions:
+
+```{r champions-profile}
+champions_profile <- churn_data %>%
+  left_join(
+    rfm_scored %>% select(customer_unique_id, segment),
+    by = "customer_unique_id"
+  ) %>%
+  filter(segment == "Champions") %>%
+  summarise(
+    customers     = n(),
+    avg_orders    = round(mean(total_orders,           na.rm = TRUE), 2),
+    avg_spent     = round(mean(total_spent,            na.rm = TRUE), 2),
+    avg_recency   = round(mean(days_since_last_order,  na.rm = TRUE), 0),
+    total_revenue = round(sum(total_spent,             na.rm = TRUE), 0)
+  )
+
+knitr::kable(champions_profile,
+             caption = "Champions Segment Profile",
+             col.names = c("Customers", "Avg Orders",
+                           "Avg Spent (R$)",
+                           "Avg Days Since Order",
+                           "Total Revenue (R$)"))
+```
+
+**VIP program elements:**
+
+- Early access to new products and sales
+- Free shipping on all orders
+- Dedicated customer support
+- Birthday discount voucher
+- Quarterly "thank you" gift voucher
+
+---
+
+## Recommendation 4 — Fix Post-Purchase Engagement
+
+**Priority: MEDIUM**
+
+**Based on:** Month 1 retention = 0.47%, 
+no engagement after purchase drives churn
+
+**The Problem:**
+
+After a customer places an order, Olist 
+has no touchpoint strategy. The customer 
+completes their purchase and disappears — 
+with no reminder, recommendation, or 
+reason to return.
+
+**The Recommendation:**
+
+Implement a post-purchase email sequence 
+for every customer:
+
+```{r email-sequence}
+email_seq = data.frame(
+  Day = c("Day 3", "Day 7", "Day 21", 
+          "Day 45", "Day 90"),
+  Email = c(
+    "Delivery confirmation + review request",
+    "Thank you + similar product recommendations",
+    "Category restock reminder",
+    "Exclusive discount — next purchase",
+    "Re-engagement offer if no purchase"
+  ),
+  Goal = c(
+    "Confirm satisfaction",
+    "Drive product discovery",
+    "Trigger repeat need",
+    "Convert to repeat buyer",
+    "Prevent full churn"
+  )
+)
+
+knitr::kable(email_seq,
+             caption = "Recommended Post-Purchase Email Sequence")
+```
+
+---
+
+## Recommendation 5 — Focus on High Frequency Categories
+
+**Priority: MEDIUM**
+
+**Based on:** Low repeat rate partly driven 
+by low-frequency product categories
+
+**The Problem:**
+
+Olist's top categories (furniture, bed/bath, 
+electronics) are naturally low-frequency 
+purchases. Customers buy once and have no 
+need to return for months or years.
+
+**The Recommendation:**
+
+Strategically expand into high-frequency 
+categories to create natural repeat 
+purchase opportunities:
+
+```{r category-recommendation}
+high_freq = data.frame(
+  Category = c(
+    "Health & Beauty (refills)",
+    "Pet Food & Supplies",
+    "Office Supplies",
+    "Baby Products",
+    "Sports Nutrition"
+  ),
+  Purchase_Frequency = c(
+    "Monthly", "Weekly/Monthly",
+    "Monthly", "Weekly",
+    "Monthly"
+  ),
+  Retention_Impact = c(
+    "High", "Very High",
+    "Medium", "Very High",
+    "High"
+  )
+)
+
+knitr::kable(high_freq,
+             caption = "Recommended High-Frequency Categories",
+             col.names = c("Category", 
+                           "Purchase Frequency",
+                           "Expected Retention Impact"))
+```
+
+---
+
+## Recommendation Priority Matrix
+
+```{r priority-matrix}
+priority = data.frame(
+  Recommendation = c(
+    "Launch Loyalty Program",
+    "At Risk Win-Back Campaign",
+    "Protect Champions — VIP Program",
+    "Post-Purchase Email Sequence",
+    "Expand High-Frequency Categories"
+  ),
+  Priority = c(
+    "HIGH", "HIGH", "HIGH",
+    "MEDIUM", "MEDIUM"
+  ),
+  Timeline = c(
+    "0-3 months", "Immediate",
+    "0-3 months", "0-1 month",
+    "3-6 months"
+  ),
+  Revenue_Impact = c(
+    "R$ 690,000+",
+    "R$ 2,077,785",
+    "R$ 789,972 protected",
+    "Increase repeat rate",
+    "Long-term retention"
+  )
+)
+
+knitr::kable(priority,
+             caption = "Business Recommendation Priority Matrix",
+             col.names = c("Recommendation", "Priority",
+                           "Timeline", "Expected Impact"))
+```
+
+---
+
+## Conclusion
+
+```{r conclusion}
+cat("This analysis demonstrates that Olist's\n")
+cat("core challenge is not customer satisfaction\n")
+cat("(avg review: 4.16/5) but platform loyalty.\n\n")
+cat("Three immediate actions can protect and\n")
+cat("recover significant revenue:\n\n")
+cat("1. Win-back At Risk segment → R$2.07M CLV uplift\n")
+cat("2. Protect Champions → R$789,972 revenue protected\n")
+cat("3. Loyalty program → estimated R$690,000+ uplift\n\n")
+cat("Combined potential impact: R$3.5M+\n")
+```
+
