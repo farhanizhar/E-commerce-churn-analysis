@@ -132,4 +132,4 @@ brazilian-ecommerce)
 **Farhanul Haque**
 Data Analyst
 
-[LinkedIn](www.linkedin.com/in/farhanul-haque-485215191) | [GitHub](https://github.com/farhanulhaque)
+[LinkedIn](www.linkedin.com/in/farhanul-haque-485215191) | [GitHub](https://github.com/farhanizhar)
